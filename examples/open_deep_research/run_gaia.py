@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from datetime import datetime
+from statistics import median
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,56 @@ if hf_token:
 
 append_answer_lock = threading.Lock()
 model_cache_local = threading.local()
+
+
+class ModelCallTracker:
+    def __init__(self, label: str):
+        self.label = label
+        self.generate_calls = 0
+        self.generate_seconds = 0.0
+
+    def dict(self) -> dict[str, Any]:
+        average_generate_seconds = self.generate_seconds / self.generate_calls if self.generate_calls else 0.0
+        return {
+            "label": self.label,
+            "generate_calls": self.generate_calls,
+            "generate_seconds": self.generate_seconds,
+            "average_generate_seconds": average_generate_seconds,
+        }
+
+
+class CountingModel(Model):
+    def __init__(self, wrapped_model: Model, tracker: ModelCallTracker):
+        super().__init__(
+            flatten_messages_as_text=wrapped_model.flatten_messages_as_text,
+            tool_name_key=wrapped_model.tool_name_key,
+            tool_arguments_key=wrapped_model.tool_arguments_key,
+            model_id=wrapped_model.model_id,
+            **getattr(wrapped_model, "kwargs", {}),
+        )
+        self._wrapped_model = wrapped_model
+        self._tracker = tracker
+
+    def generate(self, *args, **kwargs):
+        start = time.perf_counter()
+        self._tracker.generate_calls += 1
+        try:
+            return self._wrapped_model.generate(*args, **kwargs)
+        finally:
+            self._tracker.generate_seconds += time.perf_counter() - start
+
+    def parse_tool_calls(self, message):
+        return self._wrapped_model.parse_tool_calls(message)
+
+    @property
+    def supports_stop_parameter(self) -> bool:
+        return self._wrapped_model.supports_stop_parameter
+
+    def to_dict(self) -> dict:
+        return self._wrapped_model.to_dict()
+
+    def __getattr__(self, name: str):
+        return getattr(self._wrapped_model, name)
 
 
 def parse_args():
@@ -259,13 +310,54 @@ def serialize_messages(messages: list[Any]) -> list[Any]:
     return serialized_messages
 
 
+def count_agent_tool_calls(agent: Any) -> int:
+    if agent is None or not hasattr(agent, "memory"):
+        return 0
+    return sum(len(getattr(step, "tool_calls", []) or []) for step in getattr(agent.memory, "steps", []))
+
+
+def summarize_speculation_records(records: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    if records is None:
+        return None
+
+    speculator_records = [record for record in records if record.get("source") == "speculator"]
+    actor_records = [record for record in records if record.get("source") == "actor"]
+    accepted = [record for record in speculator_records if record.get("decision") == "accepted"]
+    salvaged = [record for record in speculator_records if record.get("decision") == "salvaged"]
+    discarded = [record for record in speculator_records if record.get("decision") == "discarded"]
+    suppressed = [record for record in speculator_records if record.get("decision") == "suppressed"]
+    actor_cache_hits = [record for record in actor_records if record.get("cache_hit")]
+    actor_executed = [record for record in actor_records if not record.get("cache_hit")]
+
+    return {
+        "speculator_records_total": len(speculator_records),
+        "speculator_tool_calls_proposed": len(speculator_records),
+        "speculator_tool_calls_executed": len(accepted) + len(salvaged) + len(discarded),
+        "speculator_tool_calls_accepted": len(accepted),
+        "speculator_tool_calls_salvaged": len(salvaged),
+        "speculator_tool_calls_discarded": len(discarded),
+        "speculator_tool_calls_suppressed": len(suppressed),
+        "speculator_exact_match_accepts": sum(1 for record in accepted if record.get("exact_match")),
+        "actor_records_total": len(actor_records),
+        "actor_tool_calls_total": len(actor_records),
+        "actor_tool_calls_executed": len(actor_executed),
+        "actor_tool_calls_cache_reused": len(actor_cache_hits),
+        "cache_hits_total": sum(1 for record in records if record.get("cache_hit")),
+    }
+
+
 def build_confidence_predictor(args) -> HeuristicConfidencePredictor | CalibratedConfidencePredictor:
     if args.speculation_calibration_path:
         return CalibratedConfidencePredictor.from_json(args.speculation_calibration_path)
     return HeuristicConfidencePredictor()
 
 
-def create_agent_team(model: Model, token_counts: dict[str, int], args):
+def create_agent_team(
+    model: Model,
+    token_counts: dict[str, int],
+    args,
+    speculator_tracker: ModelCallTracker | None = None,
+):
     text_limit = 100000
     ti_tool = TextInspectorTool(model, text_limit)
 
@@ -321,11 +413,14 @@ def create_agent_team(model: Model, token_counts: dict[str, int], args):
                 "`--speculator-model-type`."
             )
         text_webbrowser_agent = SalvageSpeculatingToolCallingAgent(
-            speculator_model=build_model(
-                args,
-                speculator_model_id,
-                speculative=True,
-                model_type=speculator_model_type,
+            speculator_model=CountingModel(
+                build_model(
+                    args,
+                    speculator_model_id,
+                    speculative=True,
+                    model_type=speculator_model_type,
+                ),
+                speculator_tracker or ModelCallTracker("speculator"),
             ),
             confidence_predictor=build_confidence_predictor(args),
             tau_c=args.speculation_tau_c,
@@ -418,8 +513,10 @@ def answer_single_question(
     example: dict, args, answers_file: str, visual_inspection_tool: TextInspectorTool
 ) -> None:
     model = build_model(args, args.model_id, speculative=False)
+    actor_tracker = ModelCallTracker("actor")
+    counted_model = CountingModel(model, actor_tracker)
     # model = InferenceClientModel(model_id="Qwen/Qwen3-32B", provider="novita", max_tokens=4096)
-    document_inspection_tool = TextInspectorTool(model, 100000)
+    document_inspection_tool = TextInspectorTool(counted_model, 100000)
 
     total_token_counts = {"input_tokens": 0, "output_tokens": 0}
     exception = None
@@ -451,6 +548,7 @@ Run verification steps if that's needed, you must make sure you find the correct
                 "Use the `visualizer` tool directly for all image understanding."
             )
 
+    wall_start = time.perf_counter()
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     output = None
     intermediate_steps = []
@@ -460,16 +558,26 @@ Run verification steps if that's needed, you must make sure you find the correct
     search_agent = None
     speculation_summary = None
     speculation_records = None
+    speculator_tracker = ModelCallTracker("speculator")
+    actor_api_calls_before_reformulation = 0
+    agent_run_seconds = None
+    reformulation_seconds = None
+    scoring_seconds = None
 
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
-        agent = create_agent_team(model, total_token_counts, args)
+        agent = create_agent_team(counted_model, total_token_counts, args, speculator_tracker=speculator_tracker)
         try:
             # Run agent 🚀
+            agent_run_start = time.perf_counter()
             agent.run(augmented_question)
+            agent_run_seconds = time.perf_counter() - agent_run_start
 
             agent_memory = agent.write_memory_to_messages()
-            final_result = prepare_response(augmented_question, agent_memory, reformulation_model=model)
+            actor_api_calls_before_reformulation = actor_tracker.generate_calls
+            reformulation_start = time.perf_counter()
+            final_result = prepare_response(augmented_question, agent_memory, reformulation_model=counted_model)
+            reformulation_seconds = time.perf_counter() - reformulation_start
 
             output = str(final_result)
             for memory_step in agent.memory.steps:
@@ -515,10 +623,44 @@ Run verification steps if that's needed, you must make sure you find the correct
             iteration_limit_exceeded = False
             break
     end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    latency_seconds = time.perf_counter() - wall_start
     total_token_counts["total_tokens"] = total_token_counts["input_tokens"] + total_token_counts["output_tokens"]
     scored_correctly = None
     if str(example["true_answer"]) != "?" and output is not None:
+        scoring_start = time.perf_counter()
         scored_correctly = question_scorer(str(output), str(example["true_answer"]))
+        scoring_seconds = time.perf_counter() - scoring_start
+
+    manager_tool_calls = count_agent_tool_calls(agent)
+    search_agent_tool_calls = count_agent_tool_calls(search_agent)
+    speculation_record_summary = summarize_speculation_records(speculation_records)
+    reformulator_api_calls = actor_tracker.generate_calls - actor_api_calls_before_reformulation
+    api_call_counts = {
+        "actor_generate_calls_total": actor_tracker.generate_calls,
+        "actor_generate_calls_before_reformulation": actor_api_calls_before_reformulation,
+        "reformulator_generate_calls": reformulator_api_calls,
+        "speculator_generate_calls": speculator_tracker.generate_calls,
+        "generate_calls_total": actor_tracker.generate_calls + speculator_tracker.generate_calls,
+    }
+    model_latency = {
+        "actor_generate_seconds_total": actor_tracker.generate_seconds,
+        "actor_generate_seconds_average": (
+            actor_tracker.generate_seconds / actor_tracker.generate_calls if actor_tracker.generate_calls else 0.0
+        ),
+        "speculator_generate_seconds_total": speculator_tracker.generate_seconds,
+        "speculator_generate_seconds_average": (
+            speculator_tracker.generate_seconds / speculator_tracker.generate_calls
+            if speculator_tracker.generate_calls
+            else 0.0
+        ),
+    }
+    tool_call_counts = {
+        "manager_tool_calls": manager_tool_calls,
+        "search_agent_tool_calls": search_agent_tool_calls,
+        "tool_calls_total": manager_tool_calls + search_agent_tool_calls,
+    }
+    if speculation_record_summary is not None:
+        tool_call_counts.update(speculation_record_summary)
 
     annotated_example = {
         "agent_name": model.model_id,
@@ -534,7 +676,14 @@ Run verification steps if that's needed, you must make sure you find the correct
         "true_answer": example["true_answer"],
         "start_time": start_time,
         "end_time": end_time,
+        "latency_seconds": latency_seconds,
+        "agent_run_seconds": agent_run_seconds,
+        "reformulation_seconds": reformulation_seconds,
+        "scoring_seconds": scoring_seconds,
         "token_counts": total_token_counts,
+        "api_call_counts": api_call_counts,
+        "model_latency": model_latency,
+        "tool_call_counts": tool_call_counts,
         "speculation_enabled": args.enable_salvage_speculation,
         "speculator_model_id": (args.speculator_model_id or args.model_id) if args.enable_salvage_speculation else None,
         "speculation_summary": speculation_summary,
@@ -603,6 +752,86 @@ def print_run_summary(answers_file: str, tasks_to_run: list[dict]) -> None:
         )
     else:
         print(f"Run summary: correct=0/0 scored, total_queued={total_count}, unscored={unscored_count}.")
+
+    if "latency_seconds" in run_results.columns:
+        latency_values = run_results["latency_seconds"].dropna().astype(float).tolist()
+        if latency_values:
+            print(
+                "Latency summary: "
+                f"avg={sum(latency_values)/len(latency_values):.2f}s, "
+                f"median={median(latency_values):.2f}s, "
+                f"max={max(latency_values):.2f}s"
+            )
+
+    def aggregate_nested_numeric_dict(column_name: str) -> dict[str, float]:
+        if column_name not in run_results.columns:
+            return {}
+
+        totals: dict[str, float] = {}
+        for value in run_results[column_name].dropna():
+            if not isinstance(value, dict):
+                continue
+            for key, nested_value in value.items():
+                if isinstance(nested_value, (int, float)):
+                    totals[key] = totals.get(key, 0.0) + float(nested_value)
+        return totals
+
+    api_totals = aggregate_nested_numeric_dict("api_call_counts")
+    if api_totals:
+        print(
+            "API call summary: "
+            f"actor_total={int(api_totals.get('actor_generate_calls_total', 0))}, "
+            f"reformulator_total={int(api_totals.get('reformulator_generate_calls', 0))}, "
+            f"speculator_total={int(api_totals.get('speculator_generate_calls', 0))}, "
+            f"overall_total={int(api_totals.get('generate_calls_total', 0))}"
+        )
+        if total_count > 0:
+            print(
+                "API calls per task: "
+                f"actor={api_totals.get('actor_generate_calls_total', 0.0)/total_count:.2f}, "
+                f"reformulator={api_totals.get('reformulator_generate_calls', 0.0)/total_count:.2f}, "
+                f"speculator={api_totals.get('speculator_generate_calls', 0.0)/total_count:.2f}, "
+                f"overall={api_totals.get('generate_calls_total', 0.0)/total_count:.2f}"
+            )
+
+    tool_totals = aggregate_nested_numeric_dict("tool_call_counts")
+    if tool_totals:
+        print(
+            "Tool call summary: "
+            f"manager={int(tool_totals.get('manager_tool_calls', 0))}, "
+            f"search_agent={int(tool_totals.get('search_agent_tool_calls', 0))}, "
+            f"overall={int(tool_totals.get('tool_calls_total', 0))}"
+        )
+        if total_count > 0:
+            print(
+                "Tool calls per task: "
+                f"manager={tool_totals.get('manager_tool_calls', 0.0)/total_count:.2f}, "
+                f"search_agent={tool_totals.get('search_agent_tool_calls', 0.0)/total_count:.2f}, "
+                f"overall={tool_totals.get('tool_calls_total', 0.0)/total_count:.2f}"
+            )
+
+        speculation_keys = (
+            "speculator_tool_calls_proposed",
+            "speculator_tool_calls_executed",
+            "speculator_tool_calls_accepted",
+            "speculator_tool_calls_salvaged",
+            "speculator_tool_calls_discarded",
+            "speculator_tool_calls_suppressed",
+            "actor_tool_calls_cache_reused",
+            "cache_hits_total",
+        )
+        if any(key in tool_totals for key in speculation_keys):
+            print(
+                "Speculation/cache summary: "
+                f"proposed={int(tool_totals.get('speculator_tool_calls_proposed', 0))}, "
+                f"executed={int(tool_totals.get('speculator_tool_calls_executed', 0))}, "
+                f"accepted={int(tool_totals.get('speculator_tool_calls_accepted', 0))}, "
+                f"salvaged={int(tool_totals.get('speculator_tool_calls_salvaged', 0))}, "
+                f"discarded={int(tool_totals.get('speculator_tool_calls_discarded', 0))}, "
+                f"suppressed={int(tool_totals.get('speculator_tool_calls_suppressed', 0))}, "
+                f"cache_reused={int(tool_totals.get('actor_tool_calls_cache_reused', 0))}, "
+                f"cache_hits={int(tool_totals.get('cache_hits_total', 0))}"
+            )
 
     if wrong_task_ids:
         print(f"Wrong task_ids: {', '.join(wrong_task_ids)}")

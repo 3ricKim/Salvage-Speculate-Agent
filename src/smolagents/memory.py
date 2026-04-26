@@ -60,6 +60,7 @@ class ActionStep(MemoryStep):
     observations: str | None = None
     observations_images: list["PIL.Image.Image"] | None = None
     action_output: Any = None
+    speculation_records: list[dict[str, Any]] | None = None
     token_usage: TokenUsage | None = None
     is_final_answer: bool = False
 
@@ -85,6 +86,7 @@ class ActionStep(MemoryStep):
             if self.observations_images
             else None,
             "action_output": make_json_serializable(self.action_output),
+            "speculation_records": self.speculation_records,
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
         }

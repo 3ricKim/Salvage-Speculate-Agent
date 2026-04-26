@@ -177,42 +177,85 @@ class GoogleSearchTool(Tool):
         import os
 
         self.provider = provider
+        self.provider_api_keys = {
+            "serpapi": os.getenv("SERPAPI_API_KEY"),
+            "serper": os.getenv("SERPER_API_KEY"),
+        }
         if provider == "serpapi":
             self.organic_key = "organic_results"
             api_key_env_name = "SERPAPI_API_KEY"
         else:
             self.organic_key = "organic"
             api_key_env_name = "SERPER_API_KEY"
-        self.api_key = os.getenv(api_key_env_name)
+        self.api_key = self.provider_api_keys[provider]
         if self.api_key is None:
             raise ValueError(f"Missing API key. Make sure you have '{api_key_env_name}' in your env variables.")
 
     def forward(self, query: str, filter_year: int | None = None) -> str:
         import requests
 
-        if self.provider == "serpapi":
+        last_error = None
+        candidate_providers = [self.provider]
+        for fallback_provider in ("serpapi", "serper"):
+            if fallback_provider not in candidate_providers and self.provider_api_keys.get(fallback_provider):
+                candidate_providers.append(fallback_provider)
+
+        for provider in candidate_providers:
+            api_key = self.provider_api_keys.get(provider)
+            if api_key is None:
+                continue
+            try:
+                results = self._perform_search(provider=provider, api_key=api_key, query=query, filter_year=filter_year)
+                organic_key = "organic_results" if provider == "serpapi" else "organic"
+                return self._format_results(results, organic_key=organic_key, query=query, filter_year=filter_year)
+            except Exception as error:
+                last_error = error
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise ValueError("No configured search provider succeeded.")
+
+    def _perform_search(self, provider: str, api_key: str, query: str, filter_year: int | None = None) -> dict[str, Any]:
+        import requests
+
+        if provider == "serpapi":
             params = {
                 "q": query,
-                "api_key": self.api_key,
+                "api_key": api_key,
                 "engine": "google",
                 "google_domain": "google.com",
             }
-            base_url = "https://serpapi.com/search.json"
+            if filter_year is not None:
+                params["tbs"] = f"cdr:1,cd_min:01/01/{filter_year},cd_max:12/31/{filter_year}"
+            response = requests.get("https://serpapi.com/search.json", params=params)
         else:
-            params = {
-                "q": query,
-                "api_key": self.api_key,
-            }
-            base_url = "https://google.serper.dev/search"
-        if filter_year is not None:
-            params["tbs"] = f"cdr:1,cd_min:01/01/{filter_year},cd_max:12/31/{filter_year}"
-
-        response = requests.get(base_url, params=params)
+            payload: dict[str, Any] = {"q": query}
+            if filter_year is not None:
+                payload["tbs"] = f"cdr:1,cd_min:01/01/{filter_year},cd_max:12/31/{filter_year}"
+            response = requests.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
 
         if response.status_code == 200:
-            results = response.json()
-        else:
-            raise ValueError(response.json())
+            return response.json()
+
+        try:
+            error_payload = response.json()
+        except Exception:
+            error_payload = {"message": response.text, "statusCode": response.status_code}
+        raise ValueError(error_payload)
+
+    def _format_results(
+        self,
+        results: dict[str, Any],
+        organic_key: str,
+        query: str,
+        filter_year: int | None = None,
+    ) -> str:
+        self.organic_key = organic_key
 
         if self.organic_key not in results.keys():
             if filter_year is not None:

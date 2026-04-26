@@ -30,6 +30,7 @@ import pydub
 import requests
 import speech_recognition as sr
 from bs4 import BeautifulSoup
+from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import SRTFormatter
 
@@ -129,16 +130,24 @@ class PlainTextConverter(DocumentConverter):
 
     def convert(self, local_path: str, **kwargs: Any) -> None | DocumentConverterResult:
         # Guess the content type from any file extension that might be around
-        content_type, _ = mimetypes.guess_type("__placeholder" + kwargs.get("file_extension", ""))
+        extension = kwargs.get("file_extension", "")
+        content_type, _ = mimetypes.guess_type("__placeholder" + extension)
 
-        # Only accept text files
-        if content_type is None:
+        is_xml = extension.lower() == ".xml" or content_type in {"application/xml", "text/xml"}
+        is_json = extension.lower() in {".json", ".jsonl", ".jsonld"} or content_type in {
+            "application/json",
+            "application/ld+json",
+            "text/json",
+        }
+
+        # Only accept text files, XML markup, and JSON documents.
+        if content_type is None and not is_xml and not is_json:
             return None
-        # elif "text/" not in content_type.lower():
-        #     return None
+        elif content_type is not None and "text/" not in content_type.lower() and not is_xml and not is_json:
+            return None
 
         text_content = ""
-        with open(local_path, "rt", encoding="utf-8") as fh:
+        with open(local_path, "rt", encoding="utf-8", errors="replace") as fh:
             text_content = fh.read()
         return DocumentConverterResult(
             title=None,
@@ -514,6 +523,20 @@ class MediaConverter(DocumentConverter):
             except Exception:
                 return None
 
+    def _transcribe_audio_with_openai(self, local_path) -> str:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+
+        model = os.getenv("OPENAI_AUDIO_TRANSCRIPTION_MODEL", "whisper-1")
+        client = OpenAI()
+        with open(local_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(model=model, file=audio_file)
+
+        text = getattr(transcript, "text", None)
+        if text is None and isinstance(transcript, dict):
+            text = transcript.get("text")
+        return (text or "").strip()
+
 
 class WavConverter(MediaConverter):
     """
@@ -551,7 +574,11 @@ class WavConverter(MediaConverter):
             transcript = self._transcribe_audio(local_path)
             md_content += "\n\n### Audio Transcript:\n" + ("[No speech detected]" if transcript == "" else transcript)
         except Exception:
-            md_content += "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
+            try:
+                transcript = self._transcribe_audio_with_openai(local_path)
+                md_content += "\n\n### Audio Transcript:\n" + ("[No speech detected]" if transcript == "" else transcript)
+            except Exception:
+                md_content += "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
 
         return DocumentConverterResult(
             title=None,
@@ -600,23 +627,23 @@ class Mp3Converter(WavConverter):
         handle, temp_path = tempfile.mkstemp(suffix=".wav")
         os.close(handle)
         try:
-            if extension.lower() == ".mp3":
-                sound = pydub.AudioSegment.from_mp3(local_path)
-            else:
-                sound = pydub.AudioSegment.from_file(local_path, format="m4a")
-            sound.export(temp_path, format="wav")
-
-            _args = dict()
-            _args.update(kwargs)
-            _args["file_extension"] = ".wav"
-
             try:
+                if extension.lower() == ".mp3":
+                    sound = pydub.AudioSegment.from_mp3(local_path)
+                else:
+                    sound = pydub.AudioSegment.from_file(local_path, format="m4a")
+                sound.export(temp_path, format="wav")
                 transcript = super()._transcribe_audio(temp_path).strip()
                 md_content += "\n\n### Audio Transcript:\n" + (
                     "[No speech detected]" if transcript == "" else transcript
                 )
             except Exception:
-                md_content += "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
+                transcript = self._transcribe_audio_with_openai(local_path)
+                md_content += "\n\n### Audio Transcript:\n" + (
+                    "[No speech detected]" if transcript == "" else transcript
+                )
+        except Exception:
+            md_content += "\n\n### Audio Transcript:\nError. Could not transcribe this audio."
 
         finally:
             os.unlink(temp_path)

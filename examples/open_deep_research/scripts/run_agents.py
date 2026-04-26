@@ -18,7 +18,8 @@ def serialize_agent_error(obj):
 def get_image_description(file_name: str, question: str, visual_inspection_tool) -> str:
     prompt = f"""Write a caption of 5 sentences for this image. Pay special attention to any details that might be useful for someone answering the following question:
 {question}. But do not try to answer the question directly!
-Do not add any information that is not present in the image."""
+Do not add any information that is not present in the image.
+If the image contains readable text, equations, tables, fractions, labels, or other symbols, include that visible text exactly where useful."""
     return visual_inspection_tool(image_path=file_name, question=prompt)
 
 
@@ -37,13 +38,15 @@ def get_single_file_description(file_path: str, question: str, visual_inspection
             f"\n     -> Image description: {get_image_description(file_path, question, visual_inspection_tool)}"
         )
         return file_description
-    elif file_extension in ["pdf", "xls", "xlsx", "docx", "doc", "xml"]:
+    elif file_extension in ["pdf", "xls", "xlsx", "docx", "doc", "xml", "json", "jsonl", "jsonld"]:
         image_path = file_path.split(".")[0] + ".png"
-        if os.path.exists(image_path):
-            description = get_image_description(image_path, question, visual_inspection_tool)
-            file_path = image_path
-        else:
+        try:
             description = get_document_description(file_path, question, document_inspection_tool)
+        except Exception:
+            if os.path.exists(image_path):
+                description = get_image_description(image_path, question, visual_inspection_tool)
+            else:
+                raise
         file_description = f" - Attached document: {file_path}"
         file_description += f"\n     -> File description: {description}"
         return file_description

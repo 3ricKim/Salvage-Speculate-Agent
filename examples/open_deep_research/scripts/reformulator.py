@@ -92,9 +92,39 @@ def infer_requested_decimal_places(original_task: str) -> int | None:
     return int(round(log_ratio))
 
 
+def task_expects_numeric_answer(original_task: str) -> bool:
+    task_lower = original_task.lower()
+
+    numeric_phrases = (
+        "how many",
+        "what is the average",
+        "what is the sum",
+        "what is the total",
+        "what is the difference",
+        "what is the distance",
+        "what is the population",
+        "what is the result",
+        "what is the current age",
+        "calculate",
+        "rounded to",
+        "in angstrom",
+        "in meters",
+        "in centimeters",
+        "in millimeters",
+        "in micrometers",
+        "in nanometers",
+        "in picometers",
+    )
+
+    return any(phrase in task_lower for phrase in numeric_phrases)
+
+
 def postprocess_final_answer(original_task: str, final_answer: str) -> str:
     cleaned_answer = final_answer.strip()
     if not cleaned_answer:
+        return cleaned_answer
+
+    if not task_expects_numeric_answer(original_task):
         return cleaned_answer
 
     numeric_fragments = extract_numeric_answer_fragments(cleaned_answer)
